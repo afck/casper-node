@@ -21,7 +21,7 @@ use casper_types::{auction::BLOCK_REWARD, U512};
 
 use crate::{
     components::consensus::{
-        config::ProtocolConfig,
+        config::{Config, ProtocolConfig},
         consensus_protocol::{BlockContext, ConsensusProtocol, ProtocolOutcome},
         highway_core::{
             active_validator::Effect as AvEffect,
@@ -34,7 +34,7 @@ use crate::{
         },
         traits::{ConsensusValueT, Context, NodeIdT},
     },
-    types::Timestamp,
+    types::{TimeDiff, Timestamp},
     NodeRng,
 };
 
@@ -58,15 +58,19 @@ where
     vertices_to_be_added_later: BTreeMap<Timestamp, Vec<(I, PreValidatedVertex<C>)>>,
     /// A tracker for whether we are keeping up with the current round exponent or not.
     round_success_meter: RoundSuccessMeter<C>,
+    /// The duration for which incoming vertices with missing dependencies are kept in a queue.
+    pending_vertex_timeout: TimeDiff,
 }
 
 impl<I: NodeIdT, C: Context + 'static> HighwayProtocol<I, C> {
     /// Creates a new boxed `HighwayProtocol` instance.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_boxed(
         instance_id: C::InstanceId,
         validator_stakes: BTreeMap<C::ValidatorId, U512>,
         slashed: &HashSet<C::ValidatorId>,
         protocol_config: &ProtocolConfig,
+        config: &Config,
         prev_cp: Option<&dyn ConsensusProtocol<I, C>>,
         start_time: Timestamp,
         seed: u64,
@@ -147,6 +151,7 @@ impl<I: NodeIdT, C: Context + 'static> HighwayProtocol<I, C> {
                 max_round_exp,
                 start_timestamp,
             ),
+            pending_vertex_timeout: config.pending_vertex_timeout,
         })
     }
 
@@ -218,6 +223,9 @@ impl<I: NodeIdT, C: Context + 'static> HighwayProtocol<I, C> {
         sender: I,
         pvv: PreValidatedVertex<C>,
     ) -> Vec<ProtocolOutcome<I, C>> {
+        if Timestamp::now() + self.pending_vertex_timeout < future_timestamp {
+            return Vec::new(); // Timestamp too far in the future; ignore.
+        }
         self.vertices_to_be_added_later
             .entry(future_timestamp)
             .or_insert_with(Vec::new)
