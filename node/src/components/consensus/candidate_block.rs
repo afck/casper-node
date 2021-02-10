@@ -3,6 +3,7 @@ use blake2::{
     VarBlake2b,
 };
 use datasize::DataSize;
+use derive_more::Display;
 use serde::{Deserialize, Serialize};
 
 use casper_types::PublicKey;
@@ -12,6 +13,22 @@ use crate::{
     crypto::hash::Digest,
     types::{ProtoBlock, Timestamp},
 };
+
+#[derive(
+    Copy,
+    Clone,
+    DataSize,
+    Debug,
+    Display,
+    PartialOrd,
+    Ord,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
+pub(crate) struct CandidateBlockHash(Digest);
 
 /// A proposed block. Once the consensus protocol reaches agreement on it, it will be converted to
 /// a `FinalizedBlock`.
@@ -53,18 +70,8 @@ impl CandidateBlock {
     pub(crate) fn accusations(&self) -> &Vec<PublicKey> {
         &self.accusations
     }
-}
 
-impl From<CandidateBlock> for ProtoBlock {
-    fn from(cb: CandidateBlock) -> ProtoBlock {
-        cb.proto_block
-    }
-}
-
-impl ConsensusValueT for CandidateBlock {
-    type Hash = Digest;
-
-    fn hash(&self) -> Self::Hash {
+    pub(crate) fn hash(&self) -> CandidateBlockHash {
         let CandidateBlock {
             proto_block,
             timestamp,
@@ -79,10 +86,28 @@ impl ConsensusValueT for CandidateBlock {
         hasher.finalize_variable(|slice| {
             result.copy_from_slice(slice);
         });
-        result.into()
+        CandidateBlockHash(result.into())
+    }
+
+    pub(crate) fn needs_validation(&self) -> bool {
+        !self.proto_block.wasm_deploys().is_empty() || !self.proto_block.transfers().is_empty()
+    }
+}
+
+impl From<CandidateBlock> for ProtoBlock {
+    fn from(cb: CandidateBlock) -> ProtoBlock {
+        cb.proto_block
+    }
+}
+
+impl ConsensusValueT for CandidateBlock {
+    type Hash = CandidateBlockHash;
+
+    fn hash(&self) -> Self::Hash {
+        self.hash()
     }
 
     fn needs_validation(&self) -> bool {
-        !self.proto_block.wasm_deploys().is_empty() || !self.proto_block.transfers().is_empty()
+        self.needs_validation()
     }
 }
