@@ -12,10 +12,12 @@ use itertools::Itertools;
 use prometheus::{IntGauge, Registry};
 use tracing::{debug, error, info, warn};
 
-use casper_types::{ExecutionResult, ProtocolVersion, PublicKey, SemVer};
+use casper_types::{ExecutionResult, ProtocolVersion, PublicKey};
 
 use super::{consensus::EraId, Component};
 use crate::{
+    components::contract_runtime::EraValidatorsRequest,
+    crypto::hash::Digest,
     effect::{
         announcements::LinearChainAnnouncement,
         requests::{
@@ -175,6 +177,9 @@ pub(crate) struct LinearChain<I> {
     /// Finality signatures to be inserted in a block once it is available.
     pending_finality_signatures: HashMap<PublicKey, HashMap<BlockHash, FinalitySignature>>,
     signature_cache: SignatureCache,
+    initial_state_root_hash: Digest,
+    activation_era_id: EraId,
+    protocol_version: ProtocolVersion,
 
     #[data_size(skip)]
     metrics: LinearChainMetrics,
@@ -183,12 +188,25 @@ pub(crate) struct LinearChain<I> {
 }
 
 impl<I> LinearChain<I> {
-    pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
+    pub fn new(
+        registry: &Registry,
+        initial_state_root_hash: Digest,
+        protocol_version: semver::Version,
+        activation_era_id: EraId,
+    ) -> Result<Self, prometheus::Error> {
         let metrics = LinearChainMetrics::new(registry)?;
+        let protocol_version = ProtocolVersion::from_parts(
+            protocol_version.major as u32,
+            protocol_version.minor as u32,
+            protocol_version.patch as u32,
+        );
         Ok(LinearChain {
             latest_block: None,
             pending_finality_signatures: HashMap::new(),
             signature_cache: SignatureCache::new(),
+            initial_state_root_hash,
+            activation_era_id,
+            protocol_version,
             metrics,
             _marker: PhantomData,
         })
@@ -444,15 +462,58 @@ where
                     self.signature_cache.insert(*signatures.clone());
                 }
                 // Check if the validator is bonded in the era in which the block was created.
-                effect_builder
-                    .is_bonded_validator(fs.era_id, fs.public_key)
-                    .map(|is_bonded| {
-                        if is_bonded {
-                            Ok((maybe_signatures, fs, is_bonded))
-                        } else {
-                            Err((maybe_signatures, fs))
+                // TODO: Use protocol version that is valid for the block's height.
+                let protocol_version = self.protocol_version;
+                let initial_state_root_hash = self.initial_state_root_hash;
+                let activation_era_id = self.activation_era_id;
+                async move {
+                    if fs.era_id == activation_era_id {
+                        let maybe_root_hash = match effect_builder
+                            .get_key_block_for_era_id_from_storage(fs.era_id)
+                            .await
+                        {
+                            None => Some(initial_state_root_hash),
+                            Some(key_block) => effect_builder
+                                .get_block_at_height_from_storage(key_block.height() + 1)
+                                .await
+                                .map(|block| *block.state_root_hash()),
+                        };
+                        let maybe_validators = match maybe_root_hash {
+                            None => None,
+                            Some(root_hash) => {
+                                let req =
+                                    EraValidatorsRequest::new(root_hash.into(), protocol_version);
+                                effect_builder.get_era_validators(req).await.ok()
+                            }
+                        };
+                        match maybe_validators {
+                            None => Err((maybe_signatures, fs)),
+                            Some(era_validators) => match era_validators.get(&fs.era_id.0) {
+                                None => Err((maybe_signatures, fs)),
+                                Some(validators) => {
+                                    let is_bonded = validators.contains_key(&fs.public_key);
+                                    Ok((maybe_signatures, fs, is_bonded))
+                                }
+                            },
                         }
-                    })
+                    } else {
+                        match effect_builder
+                            .get_key_block_for_era_id_from_storage(fs.era_id)
+                            .await
+                        {
+                            None => Err((maybe_signatures, fs)),
+                            Some(key_block) => {
+                                match key_block.header().next_era_validator_weights() {
+                                    None => Err((maybe_signatures, fs)),
+                                    Some(validators) => {
+                                        let is_bonded = validators.contains_key(&fs.public_key);
+                                        Ok((maybe_signatures, fs, is_bonded))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             .result(
                 |(maybe_signatures, fs, is_bonded)| {
@@ -469,13 +530,12 @@ where
                     Some(block) => {
                         let latest_header = block.header();
                         let state_root_hash = latest_header.state_root_hash();
-                        // TODO: Use protocol version that is valid for the block's height.
-                        let protocol_version = ProtocolVersion::new(SemVer::V1_0_0);
                         effect_builder
                             .is_bonded_in_future_era(
                                 *state_root_hash,
                                 fs.era_id,
-                                protocol_version,
+                                // TODO: Use protocol version that is valid for the block's height.
+                                self.protocol_version,
                                 fs.public_key,
                             )
                             .map(|res| {
@@ -498,6 +558,7 @@ where
                 }
             }
             Event::IsBonded(Some(mut signatures), fs, true) => {
+                info!("FINSIG bonded {:?} {}", fs, signatures.proofs.len());
                 // Known block and signature from a bonded validator.
                 // Check if we had already seen this signature before.
                 let signature_known = signatures
@@ -531,13 +592,15 @@ where
                     effects
                 }
             }
-            Event::IsBonded(None, _, true) => {
+            Event::IsBonded(None, fs, true) => {
+                info!("FINSIG bonded, block unknown {:?}", fs);
                 // Unknown block but validator is bonded.
                 // We should finalize the same block eventually. Either in this or in the
                 // next era.
                 Effects::new()
             }
             Event::IsBonded(Some(_), fs, false) | Event::IsBonded(None, fs, false) => {
+                info!("FINSIG not bonded {:?}", fs);
                 self.remove_from_pending_fs(&fs);
                 // Unknown validator.
                 let FinalitySignature {
