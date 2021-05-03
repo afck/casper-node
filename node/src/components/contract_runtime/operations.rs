@@ -1,18 +1,21 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
-use super::ContractRuntimeMetrics;
-use crate::{crypto::hash::Digest, types::DeployHash};
+use itertools::Itertools;
+use tokio::task;
+use tracing::{debug, error, trace};
+
 use casper_execution_engine::{
     core::engine_state::{
-        self, EngineState, ExecutionResult as EngineExecutionResult, ExecutionResults,
+        self, EngineState, ExecuteRequest, ExecutionResult as EngineExecutionResult,
+        ExecutionResults,
     },
     shared::{additive_map::AdditiveMap, newtypes::CorrelationId, transform::Transform},
     storage::global_state::{lmdb::LmdbGlobalState, CommitResult},
 };
 use casper_types::{ExecutionResult, Key};
-use engine_state::ExecuteRequest;
-use itertools::Itertools;
-use tracing::{debug, error, trace};
+
+use super::ContractRuntimeMetrics;
+use crate::{crypto::hash::Digest, types::DeployHash};
 
 /// Commits the execution effects.
 pub(super) async fn commit_execution_effects(
@@ -71,19 +74,23 @@ pub(super) async fn commit_execution_effects(
     }
 }
 
-pub(super) async fn commit(
+async fn commit(
     engine_state: Arc<EngineState<LmdbGlobalState>>,
     metrics: Arc<ContractRuntimeMetrics>,
     state_root_hash: Digest,
     effects: AdditiveMap<Key, Transform>,
 ) -> Result<CommitResult, engine_state::Error> {
     trace!(?state_root_hash, ?effects, "commit");
-    let correlation_id = CorrelationId::new();
-    let start = Instant::now();
-    let result = engine_state.apply_effect(correlation_id, state_root_hash.into(), effects);
-    metrics.apply_effect.observe(start.elapsed().as_secs_f64());
-    trace!(?result, "commit result");
-    result
+    task::spawn_blocking(move || {
+        let correlation_id = CorrelationId::new();
+        let start = Instant::now();
+        let result = engine_state.apply_effect(correlation_id, state_root_hash.into(), effects);
+        metrics.apply_effect.observe(start.elapsed().as_secs_f64());
+        trace!(?result, "commit result");
+        result
+    })
+    .await
+    .expect("should run commit task")
 }
 
 pub(super) async fn execute(
@@ -92,10 +99,14 @@ pub(super) async fn execute(
     execute_request: ExecuteRequest,
 ) -> Result<VecDeque<EngineExecutionResult>, engine_state::Error> {
     trace!(?execute_request, "execute");
-    let correlation_id = CorrelationId::new();
-    let start = Instant::now();
-    let result = engine_state.run_execute(correlation_id, execute_request);
-    metrics.run_execute.observe(start.elapsed().as_secs_f64());
-    trace!(?result, "execute result");
-    result
+    task::spawn_blocking(move || {
+        let correlation_id = CorrelationId::new();
+        let start = Instant::now();
+        let result = engine_state.run_execute(correlation_id, execute_request);
+        metrics.run_execute.observe(start.elapsed().as_secs_f64());
+        trace!(?result, "execute result");
+        result
+    })
+    .await
+    .expect("should run execute task")
 }
