@@ -51,7 +51,7 @@ function main() {
     #do_start_node '5' "$RESTART_HASH"
 
     # 11. wait auction_delay + 1 + 1 more for partial era protection
-    do_await_era_change '5'
+    do_await_era_change '3'
     # 12. Assert that restarted validator is producing blocks.
     assert_node_proposed '5' '180'
     # 13. Check for equivocators
